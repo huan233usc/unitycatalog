@@ -17,10 +17,10 @@ val artifactNamePrefix = "unitycatalog"
 lazy val javacRelease11 = Seq("--release", "11")
 lazy val javacRelease17 = Seq("--release", "17")
 
-lazy val scala213 = "2.13.16"
+lazy val scala213 = "2.12.18"
 
-lazy val deltaVersion = "4.0.0"
-lazy val sparkVersion = "4.0.0"
+lazy val deltaVersion = "3.4.0-SNAPSHOT"
+lazy val sparkVersion = "3.5.3"
 
 // Library versions
 lazy val jacksonVersion = "2.17.0"
@@ -562,6 +562,11 @@ lazy val spark = (project in file("connectors/spark"))
     Compile / compile / javacOptions ++= javacRelease11,
     libraryDependencies ++= Seq(
       "org.apache.spark" %% "spark-sql" % sparkVersion % Provided,
+      "io.delta" % "delta-kernel-api" % deltaVersion,
+      "io.delta" % "delta-kernel-default" % deltaVersion,
+      "io.delta" % "delta-storage" % deltaVersion,
+      "io.delta" % "delta-unity" % deltaVersion,
+      "io.delta" % "delta-spark" % deltaVersion,
       "com.fasterxml.jackson.core" % "jackson-databind" % "2.15.0",
       "com.fasterxml.jackson.module" %% "jackson-module-scala" % "2.15.0",
       "com.fasterxml.jackson.core" % "jackson-annotations" % "2.15.0",

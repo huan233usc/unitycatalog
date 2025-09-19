@@ -3,9 +3,17 @@ package io.unitycatalog.spark
 import io.unitycatalog.client.{ApiClient, ApiException}
 import io.unitycatalog.client.api.{SchemasApi, TablesApi, TemporaryCredentialsApi}
 import io.unitycatalog.client.model.{ColumnInfo, ColumnTypeName, CreateSchema, CreateTable, DataSourceFormat, GenerateTemporaryPathCredential, GenerateTemporaryTableCredential, ListTablesResponse, PathOperation, SchemaInfo, TableOperation, TableType, TemporaryCredentials}
+import io.delta.storage.commit.uccommitcoordinator.UCTokenBasedRestClient
+import io.delta.kernel.defaults.engine.DefaultEngine
+import io.delta.kernel.internal.SnapshotImpl
+import io.delta.kernel.spark.catalog.SparkTable
+import io.delta.unity.UCCatalogManagedClient
 
 import java.net.URI
 import java.util
+import java.util.Optional
+import org.apache.hadoop.conf.Configuration
+import org.apache.spark.sql.SparkSession
 import org.apache.hadoop.fs.Path
 import org.apache.hadoop.fs.azurebfs.constants.ConfigurationKeys.{FS_AZURE_ACCOUNT_AUTH_TYPE_PROPERTY_NAME, FS_AZURE_ACCOUNT_IS_HNS_ENABLED, FS_AZURE_SAS_TOKEN_PROVIDER_TYPE}
 import org.apache.spark.internal.Logging
@@ -30,6 +38,7 @@ class UCSingleCatalog
   with Logging {
 
   private[this] var apiClient: ApiClient = null;
+  private[this] var ucRestClient: UCTokenBasedRestClient = null
   private[this] var temporaryCredentialsApi: TemporaryCredentialsApi = null
 
   @volatile private var delegate: TableCatalog = null
@@ -51,7 +60,10 @@ class UCSingleCatalog
       }
     }
     temporaryCredentialsApi = new TemporaryCredentialsApi(apiClient)
-    val proxy = new UCProxy(apiClient, temporaryCredentialsApi)
+    if (token != null && token.nonEmpty) {
+      ucRestClient = new UCTokenBasedRestClient(urlStr, token)
+    }
+    val proxy = new UCProxy(apiClient, temporaryCredentialsApi, ucRestClient)
     proxy.initialize(name, options)
     if (UCSingleCatalog.LOAD_DELTA_CATALOG.get()) {
       try {
@@ -78,6 +90,8 @@ class UCSingleCatalog
   override def loadTable(ident: Identifier, version:  String): Table = delegate.loadTable(ident, version)
 
   override def loadTable(ident: Identifier, timestamp:  Long): Table = delegate.loadTable(ident, timestamp)
+
+  override def loadTable(ident: Identifier, writePrivilege: util.Set[TableWritePrivilege]): Table = delegate.loadTable(ident, writePrivilege)
 
   override def tableExists(ident: Identifier): Boolean = {
     delegate.tableExists(ident)
@@ -216,7 +230,8 @@ object UCSingleCatalog {
 // An internal proxy to talk to the UC client.
 private class UCProxy(
     apiClient: ApiClient,
-    temporaryCredentialsApi: TemporaryCredentialsApi) extends TableCatalog with SupportsNamespaces {
+    temporaryCredentialsApi: TemporaryCredentialsApi,
+    ucRestClient: UCTokenBasedRestClient) extends TableCatalog with SupportsNamespaces with Logging {
   private[this] var name: String = null
   private[this] var tablesApi: TablesApi = null
   private[this] var schemasApi: SchemasApi = null
@@ -297,14 +312,65 @@ private class UCProxy(
       tracksPartitionsInCatalog = false,
       partitionColumnNames = partitionCols.sortBy(_._2).map(_._1).toSeq
     )
-    // Spark separates table lookup and data source resolution. To support Spark native data
-    // sources, here we return the `V1Table` which only contains the table metadata. Spark will
-    // resolve the data source and create scan node later.
-    Class.forName("org.apache.spark.sql.connector.catalog.V1Table")
-      .getDeclaredConstructor(classOf[CatalogTable])
-      .newInstance(sparkTable)
-      .asInstanceOf[Table]
+//    // Spark separates table lookup and data source resolution. To support Spark native data
+//    // sources, here we return the `V1Table` which only contains the table metadata. Spark will
+//    // resolve the data source and create scan node later.
+//    Class.forName("org.apache.spark.sql.connector.catalog.V1Table")
+//      .getDeclaredConstructor(classOf[CatalogTable])
+//      .newInstance(sparkTable)
+//      .asInstanceOf[Table]
+    buildDsv2Table(sparkTable, Identifier.of(Array(t.getSchemaName), t.getName))
   }
+
+  private def buildDsv2Table(catalogTable: CatalogTable, identifier: Identifier): Table = {
+    import io.delta.storage.commit.uccommitcoordinator.UCCommitCoordinatorClient.UC_TABLE_ID_KEY
+
+    // Check if this is a Unity Catalog managed table
+    val ucTableIdOpt = catalogTable.storage.properties.get(UC_TABLE_ID_KEY)
+
+    if (ucTableIdOpt.isEmpty || ucRestClient == null) {
+      // Fallback to V1Table for non-UC tables or when UC client is not available
+      return Class.forName("org.apache.spark.sql.connector.catalog.V1Table")
+        .getDeclaredConstructor(classOf[CatalogTable])
+        .newInstance(catalogTable)
+        .asInstanceOf[Table]
+    }
+
+    try {
+      // Base Hadoop conf and enrich with table storage properties
+      val baseHadoopConf: Configuration = SparkSession.active.sessionState.newHadoopConf()
+      val storageProps = catalogTable.storage.properties
+
+      // Set storage properties in Hadoop configuration
+      storageProps.foreach { case (key, value) =>
+        baseHadoopConf.set(key, value)
+      }
+
+      // Load snapshot through UC-managed client using Kernel DefaultEngine
+      val ucCatalogManagedClient = new UCCatalogManagedClient(ucRestClient)
+      val snapshot = ucCatalogManagedClient.loadSnapshot(
+        DefaultEngine.create(baseHadoopConf),
+        ucTableIdOpt.get,
+        catalogTable.location.toString,
+        Optional.empty[java.lang.Long]()
+      ).asInstanceOf[SnapshotImpl]
+
+      // Create options map from storage properties
+      val options = storageProps.asJava
+
+      // Return Kernel-backed Spark V2 table
+      new SparkTable(identifier, snapshot, options, Optional.of(catalogTable))
+    } catch {
+      case e: Exception =>
+        // In case of any failure, gracefully fall back to V1Table
+        logWarning(s"Failed to create Delta Kernel V2 table: ${e.getMessage}", e)
+        Class.forName("org.apache.spark.sql.connector.catalog.V1Table")
+          .getDeclaredConstructor(classOf[CatalogTable])
+          .newInstance(catalogTable)
+          .asInstanceOf[Table]
+    }
+  }
+
 
   override def createTable(ident: Identifier, schema: StructType, partitions: Array[Transform], properties: util.Map[String, String]): Table = {
     checkUnsupportedNestedNamespace(ident.namespace())
@@ -450,3 +516,4 @@ private class UCProxy(
     true
   }
 }
+
