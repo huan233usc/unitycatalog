@@ -110,7 +110,8 @@ public class DeltaKernelReadUtils {
                     .readParquetFiles(
                         singletonCloseableIterator(fileStatus),
                         physicalReadSchema,
-                        Optional.empty());
+                        Optional.empty())
+                    .map(fileReadResult -> fileReadResult.getData());
             try (CloseableIterator<FilteredColumnarBatch> transformedData =
                 Scan.transformPhysicalData(engine, scanState, scanFileRow, physicalDataIter)) {
               while (transformedData.hasNext()) {
