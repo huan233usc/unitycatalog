@@ -55,7 +55,7 @@ class UCSingleCatalog
     proxy.initialize(name, options)
     if (UCSingleCatalog.LOAD_DELTA_CATALOG.get()) {
       try {
-        delegate = Class.forName("org.apache.spark.sql.delta.catalog.DeltaCatalog")
+        delegate = Class.forName("io.delta.spark.dsv2.SparkCatalog")
           .getDeclaredConstructor().newInstance().asInstanceOf[TableCatalog]
         delegate.asInstanceOf[DelegatingCatalogExtension].setDelegateCatalog(proxy)
         UCSingleCatalog.DELTA_CATALOG_LOADED.set(true)
